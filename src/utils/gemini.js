@@ -48,7 +48,7 @@ module.exports.formatSpeakerResults = formatSpeakerResults;
 // Audio capture variables
 let systemAudioProc = null;
 let messageBuffer = '';
-let isProcessingTranscription = false;
+let responseQueue = Promise.resolve();
 
 
 // Reconnection variables
@@ -234,22 +234,23 @@ async function sendToGroq(transcription) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         console.log('No Groq API key configured, skipping Groq response');
-        return;
+        return { success: false, error: 'No Groq API key configured' };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping Groq');
-        return;
+        return { success: false, error: 'Empty message' };
     }
 
     const modelToUse = getModelForToday();
     if (!modelToUse) {
         console.log('All Groq daily limits exhausted');
         sendToRenderer('update-status', 'Groq limits reached for today');
-        return;
+        return { success: false, error: 'Groq limits reached for today' };
     }
 
     console.log(`Sending to Groq (${modelToUse}):`, transcription.substring(0, 100) + '...');
+    sendToRenderer('update-status', 'Generating response...');
 
     groqConversationHistory.push({
         role: 'user',
@@ -283,7 +284,7 @@ async function sendToGroq(transcription) {
             const errorText = await response.text();
             console.error('Groq API error:', response.status, errorText);
             sendToRenderer('update-status', `Groq error: ${response.status}`);
-            return;
+            return { success: false, error: `Groq error: ${response.status}` };
         }
 
         const reader = response.body.getReader();
@@ -342,10 +343,12 @@ async function sendToGroq(transcription) {
 
         console.log(`Groq response completed (${modelToUse})`);
         sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: cleanedResponse, model: modelToUse };
 
     } catch (error) {
         console.error('Error calling Groq API:', error);
         sendToRenderer('update-status', 'Groq error: ' + error.message);
+        return { success: false, error: error.message };
     }
 }
 
@@ -436,18 +439,20 @@ async function sendToGeminiFlash(transcription) {
 
 async function respondToTranscription(transcription) {
     const cleanTranscription = transcription?.trim();
-    if (!cleanTranscription || isProcessingTranscription) return;
+    if (!cleanTranscription) return responseQueue;
 
-    isProcessingTranscription = true;
-    try {
+    responseQueue = responseQueue.then(async () => {
         if (hasGroqKey()) {
-            await sendToGroq(cleanTranscription);
-        } else {
-            await sendToGeminiFlash(cleanTranscription);
+            return sendToGroq(cleanTranscription);
         }
-    } finally {
-        isProcessingTranscription = false;
-    }
+        return sendToGeminiFlash(cleanTranscription);
+    }).catch(error => {
+        console.error('Queued response failed:', error);
+        sendToRenderer('update-status', 'Response error: ' + error.message);
+        return { success: false, error: error.message };
+    });
+
+    return responseQueue;
 }
 
 async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US', isReconnect = false) {
@@ -712,10 +717,11 @@ async function startMacOSAudioCapture(geminiSessionRef) {
     console.log('SystemAudioDump started with PID:', systemAudioProc.pid);
 
     const CHUNK_DURATION = 0.1;
-    const SAMPLE_RATE = 24000;
+    const INPUT_SAMPLE_RATE = 24000;
+    const OUTPUT_SAMPLE_RATE = 16000;
     const BYTES_PER_SAMPLE = 2;
     const CHANNELS = 2;
-    const CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
+    const CHUNK_SIZE = INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
 
     let audioBuffer = Buffer.alloc(0);
 
@@ -726,12 +732,13 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             const chunk = audioBuffer.slice(0, CHUNK_SIZE);
             audioBuffer = audioBuffer.slice(CHUNK_SIZE);
 
-            const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
+            const monoChunk24k = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
+            const monoChunk = resamplePcm16Buffer(monoChunk24k, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE);
 
             if (currentProviderMode === 'cloud') {
                 sendCloudAudio(monoChunk);
             } else if (currentProviderMode === 'local') {
-                getLocalAi().processLocalAudio(monoChunk);
+                getLocalAi().processLocalAudio(monoChunk, OUTPUT_SAMPLE_RATE);
             } else {
                 const base64Data = monoChunk.toString('base64');
                 sendAudioToGemini(base64Data, geminiSessionRef);
@@ -743,7 +750,7 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             }
         }
 
-        const maxBufferSize = SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
+        const maxBufferSize = INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
         if (audioBuffer.length > maxBufferSize) {
             audioBuffer = audioBuffer.slice(-maxBufferSize);
         }
@@ -778,6 +785,27 @@ function convertStereoToMono(stereoBuffer) {
     return monoBuffer;
 }
 
+function resamplePcm16Buffer(inputBuffer, fromRate, toRate) {
+    if (fromRate === toRate) return inputBuffer;
+
+    const inputSamples = Math.floor(inputBuffer.length / 2);
+    const outputSamples = Math.max(1, Math.floor(inputSamples * toRate / fromRate));
+    const outputBuffer = Buffer.alloc(outputSamples * 2);
+
+    for (let i = 0; i < outputSamples; i++) {
+        const sourcePosition = i * (fromRate / toRate);
+        const sourceIndex = Math.floor(sourcePosition);
+        const nextIndex = Math.min(sourceIndex + 1, inputSamples - 1);
+        const ratio = sourcePosition - sourceIndex;
+        const sampleA = inputBuffer.readInt16LE(sourceIndex * 2);
+        const sampleB = inputBuffer.readInt16LE(nextIndex * 2);
+        const sample = Math.round(sampleA + (sampleB - sampleA) * ratio);
+        outputBuffer.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
+    }
+
+    return outputBuffer;
+}
+
 function stopMacOSAudioCapture() {
     if (systemAudioProc) {
         console.log('Stopping SystemAudioDump...');
@@ -794,11 +822,23 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
         await geminiSessionRef.current.sendRealtimeInput({
             audio: {
                 data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
+                mimeType: 'audio/pcm;rate=16000',
             },
         });
     } catch (error) {
         console.error('Error sending audio to Gemini:', error);
+    }
+}
+
+async function endGeminiAudioStream(geminiSessionRef) {
+    if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
+
+    try {
+        await geminiSessionRef.current.sendRealtimeInput({ audioStreamEnd: true });
+        return { success: true };
+    } catch (error) {
+        console.error('Error ending Gemini audio stream:', error);
+        return { success: false, error: error.message };
     }
 }
 
@@ -900,7 +940,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         return success;
     });
 
-    ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
+    ipcMain.handle('send-audio-content', async (event, { data, mimeType, sampleRate = 16000 }) => {
         if (currentProviderMode === 'cloud') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
@@ -914,7 +954,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, sampleRate);
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local audio:', error);
@@ -935,7 +975,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     // Handle microphone audio on a separate channel
-    ipcMain.handle('send-mic-audio-content', async (event, { data, mimeType }) => {
+    ipcMain.handle('send-mic-audio-content', async (event, { data, mimeType, sampleRate = 16000 }) => {
         if (currentProviderMode === 'cloud') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
@@ -949,7 +989,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (currentProviderMode === 'local') {
             try {
                 const pcmBuffer = Buffer.from(data, 'base64');
-                getLocalAi().processLocalAudio(pcmBuffer);
+                getLocalAi().processLocalAudio(pcmBuffer, sampleRate);
                 return { success: true };
             } catch (error) {
                 console.error('Error sending local mic audio:', error);
@@ -967,6 +1007,13 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             console.error('Error sending mic audio:', error);
             return { success: false, error: error.message };
         }
+    });
+
+    ipcMain.handle('audio-stream-end', async () => {
+        if (currentProviderMode === 'byok') {
+            return endGeminiAudioStream(geminiSessionRef);
+        }
+        return { success: true };
     });
 
     ipcMain.handle('send-image-content', async (event, { data, prompt }) => {
@@ -1156,6 +1203,7 @@ module.exports = {
     convertStereoToMono,
     stopMacOSAudioCapture,
     sendAudioToGemini,
+    endGeminiAudioStream,
     sendImageToGeminiHttp,
     setupGeminiIpcHandlers,
     formatSpeakerResults,

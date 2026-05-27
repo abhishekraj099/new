@@ -8,7 +8,7 @@ import { OnboardingView } from '../views/OnboardingView.js';
 import { AICustomizeView } from '../views/AICustomizeView.js';
 import { FeedbackView } from '../views/FeedbackView.js';
 
-export class CheatingDaddyApp extends LitElement {
+export class UpdateServiceApp extends LitElement {
     static styles = css`
         * {
             box-sizing: border-box;
@@ -399,7 +399,7 @@ export class CheatingDaddyApp extends LitElement {
             this._localVersion = await cheatingDaddy.getVersion();
             this.requestUpdate();
 
-            const res = await fetch('https://raw.githubusercontent.com/sohzm/cheating-daddy/refs/heads/master/package.json');
+            const res = await fetch('https://raw.githubusercontent.com/abhishekraj099/new/refs/heads/main/package.json');
             if (!res.ok) return;
             const remote = await res.json();
             const remoteVersion = remote.version;
@@ -620,7 +620,7 @@ export class CheatingDaddyApp extends LitElement {
     async handleAPIKeyHelp() {
         if (window.require) {
             const { ipcRenderer } = window.require('electron');
-            await ipcRenderer.invoke('open-external', 'https://cheatingdaddy.com/help/api-key');
+                await ipcRenderer.invoke('open-external', 'https://aistudio.google.com/apikey');
         }
     }
 
@@ -792,7 +792,7 @@ export class CheatingDaddyApp extends LitElement {
         return html`
             <div class="sidebar ${this._isLiveMode() ? 'hidden' : ''}">
                 <div class="sidebar-brand">
-                    <h1>Cheating Daddy</h1>
+                    <h1>update.service</h1>
                 </div>
                 <nav class="sidebar-nav">
                     ${items.map(item => html`
@@ -808,7 +808,7 @@ export class CheatingDaddyApp extends LitElement {
                 </nav>
                 <div class="sidebar-footer">
                     ${this._updateAvailable ? html`
-                        <button class="update-btn" @click=${() => this.handleExternalLinkClick('https://cheatingdaddy.com/download')}>
+                        <button class="update-btn" @click=${() => this.handleExternalLinkClick('https://github.com/abhishekraj099/new/releases')}>
                             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2M7 11l5 5l5-5m-5-7v12" /></svg>
                             Update available
                         </button>
@@ -888,4 +888,4 @@ export class CheatingDaddyApp extends LitElement {
     }
 }
 
-customElements.define('cheating-daddy-app', CheatingDaddyApp);
+customElements.define('update-service-app', UpdateServiceApp);

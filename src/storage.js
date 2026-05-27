@@ -3,6 +3,7 @@ const path = require('path');
 const os = require('os');
 
 const CONFIG_VERSION = 1;
+const APP_DATA_DIR = 'update-service-config';
 
 // Default values
 const DEFAULT_CONFIG = {
@@ -45,11 +46,11 @@ function getConfigDir() {
     let configDir;
 
     if (platform === 'win32') {
-        configDir = path.join(os.homedir(), 'AppData', 'Roaming', 'cheating-daddy-config');
+        configDir = path.join(os.homedir(), 'AppData', 'Roaming', APP_DATA_DIR);
     } else if (platform === 'darwin') {
-        configDir = path.join(os.homedir(), 'Library', 'Application Support', 'cheating-daddy-config');
+        configDir = path.join(os.homedir(), 'Library', 'Application Support', APP_DATA_DIR);
     } else {
-        configDir = path.join(os.homedir(), '.config', 'cheating-daddy-config');
+        configDir = path.join(os.homedir(), '.config', APP_DATA_DIR);
     }
 
     return configDir;

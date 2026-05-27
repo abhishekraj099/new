@@ -322,11 +322,10 @@ async function initializeLocalSession(ollamaHost, model, whisperModel, profile, 
     }
 }
 
-function processLocalAudio(monoChunk24k) {
+function processLocalAudio(monoChunk, sampleRate = 16000) {
     if (!isLocalActive) return;
 
-    // Resample from 24kHz to 16kHz
-    const pcm16k = resample24kTo16k(monoChunk24k);
+    const pcm16k = sampleRate === 16000 ? monoChunk : resample24kTo16k(monoChunk);
     if (pcm16k.length > 0) {
         processVAD(pcm16k);
     }

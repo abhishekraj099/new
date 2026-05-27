@@ -8,15 +8,21 @@ let audioProcessor = null;
 let micAudioContext = null;
 let micAudioProcessor = null;
 let micMediaStream = null;
-let audioBuffer = [];
-const SAMPLE_RATE = 24000;
+const SAMPLE_RATE = 16000;
 const AUDIO_CHUNK_DURATION = 0.1; // seconds
 const BUFFER_SIZE = 4096; // Increased buffer size for smoother audio
+const SPEECH_RMS_THRESHOLD = 0.012;
+const SPEECH_END_SILENCE_MS = 350;
+const AUDIO_FLUSH_DEBOUNCE_MS = 120;
 
 let hiddenVideo = null;
 let offscreenCanvas = null;
 let offscreenContext = null;
 let currentImageQuality = 'medium'; // Store current image quality for manual screenshots
+let hasDetectedSpeech = false;
+let lastSpeechAt = 0;
+let audioFlushTimer = null;
+let audioFlushInFlight = false;
 
 const isLinux = process.platform === 'linux';
 const isMacOS = process.platform === 'darwin';
@@ -130,6 +136,24 @@ function convertFloat32ToInt16(float32Array) {
         int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
     return int16Array;
+}
+
+function resampleFloat32ToTarget(input, fromRate, toRate = SAMPLE_RATE) {
+    if (!input || input.length === 0 || fromRate === toRate) return input;
+
+    const outputLength = Math.max(1, Math.round(input.length * toRate / fromRate));
+    const output = new Float32Array(outputLength);
+    const ratio = fromRate / toRate;
+
+    for (let i = 0; i < outputLength; i++) {
+        const sourcePosition = i * ratio;
+        const sourceIndex = Math.floor(sourcePosition);
+        const nextIndex = Math.min(sourceIndex + 1, input.length - 1);
+        const fraction = sourcePosition - sourceIndex;
+        output[i] = input[sourceIndex] + (input[nextIndex] - input[sourceIndex]) * fraction;
+    }
+
+    return output;
 }
 
 function arrayBufferToBase64(buffer) {
@@ -367,6 +391,67 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
     }
 }
 
+function calculatePcmRms(pcmData16) {
+    if (!pcmData16 || pcmData16.length === 0) return 0;
+
+    let sumSquares = 0;
+    for (let i = 0; i < pcmData16.length; i++) {
+        const sample = pcmData16[i] / 32768;
+        sumSquares += sample * sample;
+    }
+    return Math.sqrt(sumSquares / pcmData16.length);
+}
+
+function trackSpeechActivity(pcmData16) {
+    const rms = calculatePcmRms(pcmData16);
+    const now = Date.now();
+
+    if (rms >= SPEECH_RMS_THRESHOLD) {
+        hasDetectedSpeech = true;
+        lastSpeechAt = now;
+        if (audioFlushTimer) {
+            clearTimeout(audioFlushTimer);
+            audioFlushTimer = null;
+        }
+        return;
+    }
+
+    if (!hasDetectedSpeech || audioFlushTimer || now - lastSpeechAt < SPEECH_END_SILENCE_MS) {
+        return;
+    }
+
+    audioFlushTimer = setTimeout(async () => {
+        audioFlushTimer = null;
+        if (!hasDetectedSpeech || Date.now() - lastSpeechAt < SPEECH_END_SILENCE_MS || audioFlushInFlight) return;
+
+        audioFlushInFlight = true;
+        try {
+            const result = await ipcRenderer.invoke('audio-stream-end');
+            if (!result?.success && result?.error) {
+                console.warn('Audio flush skipped:', result.error);
+            }
+        } catch (error) {
+            console.warn('Audio flush failed:', error);
+        } finally {
+            hasDetectedSpeech = false;
+            audioFlushInFlight = false;
+        }
+    }, AUDIO_FLUSH_DEBOUNCE_MS);
+}
+
+async function sendPcmChunk(ipcChannel, chunk, sourceSampleRate = SAMPLE_RATE) {
+    const normalizedChunk = resampleFloat32ToTarget(chunk, sourceSampleRate);
+    const pcmData16 = convertFloat32ToInt16(normalizedChunk);
+    trackSpeechActivity(pcmData16);
+    const base64Data = arrayBufferToBase64(pcmData16.buffer);
+
+    return ipcRenderer.invoke(ipcChannel, {
+        data: base64Data,
+        mimeType: `audio/pcm;rate=${SAMPLE_RATE}`,
+        sampleRate: SAMPLE_RATE,
+    });
+}
+
 function setupLinuxMicProcessing(micStream) {
     if (micAudioProcessor) {
         micAudioProcessor.disconnect();
@@ -386,7 +471,8 @@ function setupLinuxMicProcessing(micStream) {
     const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
     let audioBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
+    const inputSampleRate = micAudioContext.sampleRate || SAMPLE_RATE;
+    const samplesPerChunk = inputSampleRate * AUDIO_CHUNK_DURATION;
 
     micProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
@@ -395,13 +481,7 @@ function setupLinuxMicProcessing(micStream) {
         // Process audio in chunks
         while (audioBuffer.length >= samplesPerChunk) {
             const chunk = audioBuffer.splice(0, samplesPerChunk);
-            const pcmData16 = convertFloat32ToInt16(chunk);
-            const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-            await ipcRenderer.invoke('send-mic-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            await sendPcmChunk('send-mic-audio-content', chunk, inputSampleRate);
         }
     };
 
@@ -421,7 +501,8 @@ function setupLinuxSystemAudioProcessing() {
     audioProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
     let audioBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
+    const inputSampleRate = audioContext.sampleRate || SAMPLE_RATE;
+    const samplesPerChunk = inputSampleRate * AUDIO_CHUNK_DURATION;
 
     audioProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
@@ -430,13 +511,7 @@ function setupLinuxSystemAudioProcessing() {
         // Process audio in chunks
         while (audioBuffer.length >= samplesPerChunk) {
             const chunk = audioBuffer.splice(0, samplesPerChunk);
-            const pcmData16 = convertFloat32ToInt16(chunk);
-            const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            await sendPcmChunk('send-audio-content', chunk, inputSampleRate);
         }
     };
 
@@ -451,7 +526,8 @@ function setupWindowsLoopbackProcessing() {
     audioProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
     let audioBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
+    const inputSampleRate = audioContext.sampleRate || SAMPLE_RATE;
+    const samplesPerChunk = inputSampleRate * AUDIO_CHUNK_DURATION;
 
     audioProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
@@ -460,13 +536,7 @@ function setupWindowsLoopbackProcessing() {
         // Process audio in chunks
         while (audioBuffer.length >= samplesPerChunk) {
             const chunk = audioBuffer.splice(0, samplesPerChunk);
-            const pcmData16 = convertFloat32ToInt16(chunk);
-            const base64Data = arrayBufferToBase64(pcmData16.buffer);
-
-            await ipcRenderer.invoke('send-audio-content', {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            });
+            await sendPcmChunk('send-audio-content', chunk, inputSampleRate);
         }
     };
 
@@ -682,6 +752,13 @@ function stopCapture() {
         clearInterval(screenshotInterval);
         screenshotInterval = null;
     }
+    if (audioFlushTimer) {
+        clearTimeout(audioFlushTimer);
+        audioFlushTimer = null;
+    }
+    hasDetectedSpeech = false;
+    lastSpeechAt = 0;
+    audioFlushInFlight = false;
 
     if (audioProcessor) {
         audioProcessor.disconnect();
@@ -807,7 +884,7 @@ function handleShortcut(shortcutKey) {
 }
 
 // Create reference to the main app element
-const cheatingDaddyApp = document.querySelector('cheating-daddy-app');
+const cheatingDaddyApp = document.querySelector('update-service-app');
 
 // ============ THEME SYSTEM ============
 const theme = {
