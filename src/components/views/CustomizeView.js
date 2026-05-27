@@ -213,7 +213,7 @@ export class CustomizeView extends LitElement {
         this.clearStatusType = '';
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
-        this.audioMode = 'speaker_only';
+        this.audioMode = 'both';
         this.customPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
@@ -229,7 +229,7 @@ export class CustomizeView extends LitElement {
             this.googleSearchEnabled = prefs.googleSearchEnabled ?? true;
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
-            this.audioMode = prefs.audioMode ?? 'speaker_only';
+            this.audioMode = prefs.audioMode ?? 'both';
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
@@ -485,7 +485,7 @@ export class CustomizeView extends LitElement {
                 selectedLanguage: 'en-US',
                 selectedScreenshotInterval: '5',
                 selectedImageQuality: 'medium',
-                audioMode: 'speaker_only',
+                audioMode: 'both',
                 fontSize: 20,
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
@@ -580,8 +580,10 @@ export class CustomizeView extends LitElement {
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
+                    ${this.audioMode === 'both' ? html`
+                        <div class="warning-callout">Uses both system audio and microphone so spoken questions can be detected in real time.</div>
+                    ` : this.audioMode === 'mic_only' ? html`
+                        <div class="warning-callout">Only microphone audio will be used. System audio from calls or videos will be ignored.</div>
                     ` : ''}
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>

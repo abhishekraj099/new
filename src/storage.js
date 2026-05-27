@@ -24,7 +24,7 @@ const DEFAULT_PREFERENCES = {
     selectedScreenshotInterval: '5',
     selectedImageQuality: 'medium',
     advancedMode: false,
-    audioMode: 'speaker_only',
+    audioMode: 'both',
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
@@ -36,7 +36,7 @@ const DEFAULT_PREFERENCES = {
 const DEFAULT_KEYBINDS = null; // null means use system defaults
 
 const DEFAULT_LIMITS = {
-    data: [] // Array of { date: 'YYYY-MM-DD', flash: { count }, flashLite: { count }, groq: { 'qwen3-32b': { chars, limit }, 'gpt-oss-120b': { chars, limit }, 'gpt-oss-20b': { chars, limit } }, gemini: { 'gemma-3-27b-it': { chars } } }
+    data: [] // Array of { date: 'YYYY-MM-DD', flash: { count }, flashLite: { count }, groq: { ... }, gemini: { 'gemini-2.5-flash': { chars } } }
 };
 
 // Get the config directory path based on OS
@@ -267,9 +267,10 @@ function getTodayLimits() {
             };
         }
         if(!todayEntry.gemini) {
-            todayEntry.gemini = {
-                'gemma-3-27b-it': { chars: 0 }
-            };
+            todayEntry.gemini = {};
+        }
+        if(!todayEntry.gemini['gemini-2.5-flash']) {
+            todayEntry.gemini['gemini-2.5-flash'] = { chars: 0 };
         }
         setLimits(limits);
         return todayEntry;
@@ -288,7 +289,7 @@ function getTodayLimits() {
             'kimi-k2-instruct': { chars: 0, limit: 600000 }
         },
         gemini: {
-            'gemma-3-27b-it': { chars: 0 }
+            'gemini-2.5-flash': { chars: 0 }
         }
     };
     limits.data.push(newEntry);

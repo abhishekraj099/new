@@ -6,6 +6,9 @@ const { getSystemPrompt } = require('./prompts');
 const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getModelForToday } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 
+const GEMINI_LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const GEMINI_TEXT_MODEL = 'gemini-2.5-flash';
+
 // Lazy-loaded to avoid circular dependency (localai.js imports from gemini.js)
 let _localai = null;
 function getLocalAi() {
@@ -45,6 +48,7 @@ module.exports.formatSpeakerResults = formatSpeakerResults;
 // Audio capture variables
 let systemAudioProc = null;
 let messageBuffer = '';
+let isProcessingTranscription = false;
 
 
 // Reconnection variables
@@ -345,19 +349,20 @@ async function sendToGroq(transcription) {
     }
 }
 
-async function sendToGemma(transcription) {
+async function sendToGeminiFlash(transcription) {
     const apiKey = getApiKey();
     if (!apiKey) {
         console.log('No Gemini API key configured');
-        return;
+        return { success: false, error: 'No Gemini API key configured' };
     }
 
     if (!transcription || transcription.trim() === '') {
-        console.log('Empty transcription, skipping Gemma');
-        return;
+        console.log('Empty transcription, skipping Gemini Flash');
+        return { success: false, error: 'Empty message' };
     }
 
-    console.log('Sending to Gemma:', transcription.substring(0, 100) + '...');
+    console.log('Sending to Gemini Flash:', transcription.substring(0, 100) + '...');
+    sendToRenderer('update-status', 'Generating response...');
 
     groqConversationHistory.push({
         role: 'user',
@@ -382,7 +387,7 @@ async function sendToGemma(transcription) {
         ];
 
         const response = await ai.models.generateContentStream({
-            model: 'gemma-3-27b-it',
+            model: GEMINI_TEXT_MODEL,
             contents: messagesWithSystem,
         });
 
@@ -403,7 +408,7 @@ async function sendToGemma(transcription) {
         const inputChars = systemPromptChars + historyChars;
         const outputChars = fullText.length;
 
-        incrementCharUsage('gemini', 'gemma-3-27b-it', inputChars + outputChars);
+        incrementCharUsage('gemini', GEMINI_TEXT_MODEL, inputChars + outputChars);
 
         if (fullText.trim()) {
             groqConversationHistory.push({
@@ -418,12 +423,30 @@ async function sendToGemma(transcription) {
             saveConversationTurn(transcription, fullText);
         }
 
-        console.log('Gemma response completed');
+        console.log('Gemini Flash response completed');
         sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: fullText, model: GEMINI_TEXT_MODEL };
 
     } catch (error) {
-        console.error('Error calling Gemma API:', error);
-        sendToRenderer('update-status', 'Gemma error: ' + error.message);
+        console.error('Error calling Gemini Flash API:', error);
+        sendToRenderer('update-status', 'Gemini Flash error: ' + error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+async function respondToTranscription(transcription) {
+    const cleanTranscription = transcription?.trim();
+    if (!cleanTranscription || isProcessingTranscription) return;
+
+    isProcessingTranscription = true;
+    try {
+        if (hasGroqKey()) {
+            await sendToGroq(cleanTranscription);
+        } else {
+            await sendToGeminiFlash(cleanTranscription);
+        }
+    } finally {
+        isProcessingTranscription = false;
     }
 }
 
@@ -464,7 +487,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
 
     try {
         const session = await client.live.connect({
-            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            model: GEMINI_LIVE_MODEL,
             callbacks: {
                 onopen: function () {
                     sendToRenderer('update-status', 'Live session connected');
@@ -485,13 +508,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     // DISABLED: Gemini's outputTranscription - using Groq for faster responses instead
                     // if (message.serverContent?.outputTranscription?.text) { ... }
 
-                    if (message.serverContent?.generationComplete) {
+                    if (message.serverContent?.generationComplete || message.serverContent?.turnComplete) {
                         if (currentTranscription.trim() !== '') {
-                            if (hasGroqKey()) {
-                                sendToGroq(currentTranscription);
-                            } else {
-                                sendToGemma(currentTranscription);
-                            }
+                            respondToTranscription(currentTranscription);
                             currentTranscription = '';
                         }
                         messageBuffer = '';
@@ -524,9 +543,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 },
             },
             config: {
-                responseModalities: [Modality.AUDIO],
-                proactivity: { proactiveAudio: true },
-                outputAudioTranscription: {},
+                responseModalities: [Modality.TEXT],
                 tools: enabledTools,
                 // Enable speaker diarization
                 inputAudioTranscription: {
@@ -535,6 +552,15 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     maxSpeakerCount: 2,
                 },
                 contextWindowCompression: { slidingWindow: {} },
+                realtimeInputConfig: {
+                    automaticActivityDetection: {
+                        disabled: false,
+                        startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+                        endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+                        prefixPaddingMs: 20,
+                        silenceDurationMs: 250,
+                    },
+                },
                 speechConfig: { languageCode: language },
                 systemInstruction: {
                     parts: [{ text: systemPrompt }],
@@ -1007,18 +1033,16 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             }
         }
 
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
-
         try {
             console.log('Sending text message:', text);
 
             if (hasGroqKey()) {
-                sendToGroq(text.trim());
+                await sendToGroq(text.trim());
             } else {
-                sendToGemma(text.trim());
+                const result = await sendToGeminiFlash(text.trim());
+                if (!result.success) return result;
             }
 
-            await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
             return { success: true };
         } catch (error) {
             console.error('Error sending text:', error);

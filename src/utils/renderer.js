@@ -5,7 +5,9 @@ let mediaStream = null;
 let screenshotInterval = null;
 let audioContext = null;
 let audioProcessor = null;
+let micAudioContext = null;
 let micAudioProcessor = null;
+let micMediaStream = null;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
 const AUDIO_CHUNK_DURATION = 0.1; // seconds
@@ -201,7 +203,7 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
     // Refresh preferences cache
     await loadPreferencesCache();
-    const audioMode = preferencesCache.audioMode || 'speaker_only';
+    const audioMode = preferencesCache.audioMode || 'both';
 
     try {
         if (isMacOS) {
@@ -319,9 +321,9 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                 audio: {
                     sampleRate: SAMPLE_RATE,
                     channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
                 },
             });
 
@@ -366,8 +368,20 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 }
 
 function setupLinuxMicProcessing(micStream) {
-    // Setup microphone audio processing for Linux
-    const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+    if (micAudioProcessor) {
+        micAudioProcessor.disconnect();
+        micAudioProcessor = null;
+    }
+    if (micAudioContext) {
+        micAudioContext.close().catch(err => console.warn('Error closing previous mic audio context:', err));
+        micAudioContext = null;
+    }
+    if (micMediaStream) {
+        micMediaStream.getTracks().forEach(track => track.stop());
+    }
+
+    micMediaStream = micStream;
+    micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
     const micSource = micAudioContext.createMediaStreamSource(micStream);
     const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
@@ -391,10 +405,12 @@ function setupLinuxMicProcessing(micStream) {
         }
     };
 
+    const silentOutput = micAudioContext.createGain();
+    silentOutput.gain.value = 0;
     micSource.connect(micProcessor);
-    micProcessor.connect(micAudioContext.destination);
+    micProcessor.connect(silentOutput);
+    silentOutput.connect(micAudioContext.destination);
 
-    // Store processor reference for cleanup
     micAudioProcessor = micProcessor;
 }
 
@@ -676,6 +692,14 @@ function stopCapture() {
     if (micAudioProcessor) {
         micAudioProcessor.disconnect();
         micAudioProcessor = null;
+    }
+    if (micAudioContext) {
+        micAudioContext.close();
+        micAudioContext = null;
+    }
+    if (micMediaStream) {
+        micMediaStream.getTracks().forEach(track => track.stop());
+        micMediaStream = null;
     }
 
     if (audioContext) {
