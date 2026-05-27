@@ -25,6 +25,8 @@ let groqConversationHistory = [];
 // Conversation tracking variables
 let currentSessionId = null;
 let currentTranscription = '';
+let currentLiveResponse = '';
+let hasStartedLiveResponse = false;
 let conversationHistory = [];
 let screenAnalysisHistory = [];
 let currentProfile = null;
@@ -83,6 +85,8 @@ function buildContextMessage() {
 function initializeNewSession(profile = null, customPrompt = null) {
     currentSessionId = Date.now().toString();
     currentTranscription = '';
+    currentLiveResponse = '';
+    hasStartedLiveResponse = false;
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
@@ -228,6 +232,56 @@ function trimConversationHistoryForGemma(history, maxChars=42000) {
 
 function stripThinkingTags(text) {
     return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
+
+function extractLiveResponseText(message) {
+    if (typeof message.text === 'string' && message.text.trim()) {
+        return message.text;
+    }
+
+    const parts = message.serverContent?.modelTurn?.parts || message.serverContent?.modelTurn?.parts || [];
+    return parts
+        .map(part => part?.text || '')
+        .filter(Boolean)
+        .join('');
+}
+
+function appendLiveResponseText(text) {
+    if (!text || !text.trim()) return;
+
+    currentLiveResponse += text;
+    const displayText = stripThinkingTags(currentLiveResponse);
+    if (!displayText) return;
+
+    sendToRenderer(hasStartedLiveResponse ? 'update-response' : 'new-response', displayText);
+    hasStartedLiveResponse = true;
+    sendToRenderer('update-status', 'Answering...');
+}
+
+function completeLiveTurn() {
+    const response = stripThinkingTags(currentLiveResponse);
+    const transcription = currentTranscription.trim();
+
+    if (response) {
+        saveConversationTurn(transcription || 'Voice question', response);
+        groqConversationHistory.push({ role: 'user', content: transcription || 'Voice question' });
+        groqConversationHistory.push({ role: 'assistant', content: response });
+
+        if (groqConversationHistory.length > 40) {
+            groqConversationHistory = groqConversationHistory.slice(-40);
+        }
+
+        currentTranscription = '';
+        currentLiveResponse = '';
+        hasStartedLiveResponse = false;
+        messageBuffer = '';
+        sendToRenderer('update-status', 'Listening...');
+        return true;
+    }
+
+    currentLiveResponse = '';
+    hasStartedLiveResponse = false;
+    return false;
 }
 
 async function sendToGroq(transcription) {
@@ -500,6 +554,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                 onmessage: function (message) {
                     console.log('----------------', message);
 
+                    appendLiveResponseText(extractLiveResponseText(message));
+
                     // Handle input transcription (what was spoken)
                     if (message.serverContent?.inputTranscription?.results) {
                         currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
@@ -510,11 +566,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         }
                     }
 
-                    // DISABLED: Gemini's outputTranscription - using Groq for faster responses instead
-                    // if (message.serverContent?.outputTranscription?.text) { ... }
-
                     if (message.serverContent?.generationComplete || message.serverContent?.turnComplete) {
-                        if (currentTranscription.trim() !== '') {
+                        const liveTurnCompleted = completeLiveTurn();
+                        if (!liveTurnCompleted && currentTranscription.trim() !== '') {
                             respondToTranscription(currentTranscription);
                             currentTranscription = '';
                         }
@@ -595,6 +649,8 @@ async function attemptReconnect() {
     // Clear stale buffers
     messageBuffer = '';
     currentTranscription = '';
+    currentLiveResponse = '';
+    hasStartedLiveResponse = false;
     // Don't reset groqConversationHistory to preserve context across reconnects
 
     sendToRenderer('update-status', `Reconnecting... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
